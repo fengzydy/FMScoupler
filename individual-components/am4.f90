@@ -693,7 +693,7 @@ subroutine override_data_3d(name, buffer, time_level, domain)
   real, dimension(:, :, :), allocatable :: override_buffer
   integer, dimension(3) :: count_
   type(FmsNetcdfDomainFile_t) :: dataset
-  integer :: i
+  integer :: i, zmin, zmax
   integer, dimension(3) :: start
 
   do i = 1, size(override_variables)
@@ -711,6 +711,11 @@ subroutine override_data_3d(name, buffer, time_level, domain)
   if (override_z_lower .lt. 0 .or. override_z_upper .lt. 0) then
     call error_mesg("override_data_3d", "you must set the overrize z limits.", fatal)
   endif
+  zmin = max(override_z_lower, 1)
+  zmax = min(override_z_upper, size(buffer, 3))
+  if (zmin .gt. zmax) then
+    call error_mesg("override_data_3d", "override z lower limit must be less than the upper limit.", fatal)
+  endif
   if (.not. open_file(dataset, override_path, "read", domain)) then
     call error_mesg("override_data_3d", "cannot find "//trim(override_path)//".", fatal)
   endif
@@ -719,7 +724,7 @@ subroutine override_data_3d(name, buffer, time_level, domain)
   allocate(override_buffer(size(buffer, 1), size(buffer, 2), size(buffer, 3)))
   call read_data(dataset, name, override_buffer, unlim_dim_level=time_level)
   call close_file(dataset)
-  buffer(:, :, override_z_lower:override_z_upper) = override_buffer(:, :, override_z_lower:override_z_upper)
+  buffer(:, :, zmin:zmax) = override_buffer(:, :, zmin:zmax)
   deallocate(override_buffer)
 end subroutine override_data_3d
 

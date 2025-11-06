@@ -28,7 +28,7 @@ use solar_constant, only: SolarConstant
 use solar_spectrum, only: SolarSpectrum
 use time_interp_external2_mod, only: time_interp_external_init
 use time_manager_mod, only: get_date, julian, print_time, set_calendar_type, time_manager_init, &
-                            time_type, operator(+), operator(-)
+                            time_type, get_time, set_time, operator(+), operator(-), operator(/)
 use tracer_manager_mod, only: get_number_tracers, get_tracer_index, &
                               tracer_manager_end, tracer_manager_init
 use utilities, only: catch_error, integrate
@@ -147,6 +147,7 @@ else
   call error_mesg("main", "only julian calendar supported.", fatal)
 endif
 time = get_cal_time(atm(1)%time(1), atm(1)%time_units, atm(1)%calendar)
+time = normalize_time(time)
 if (atm(1)%num_times .gt. 1) then
   dt = atm(1)%time(2) - atm(1)%time(1)
 else
@@ -296,7 +297,9 @@ endif
 do t = 1, atm(1)%num_times-invalid_timestep
   !Calculate the current time.
   time = get_cal_time(atm(1)%time(t), atm(1)%time_units, atm(1)%calendar)
+  time = normalize_time(time)
   time_next = get_cal_time(atm(1)%time(t) + dt, atm(1)%time_units, atm(1)%calendar)
+  time_next = normalize_time(time_next)
   call print_time(time, "Running timestep: ")
 
   !Read in the atmospheric properies.
@@ -346,6 +349,25 @@ call fms_end()
 
 contains
 
+function normalize_time(time)
+  type(time_type), intent(in) :: time
+  type(time_type) :: normalize_time
+  integer :: seconds, days, ticks, residual
+  integer, parameter :: time_step = 1800
+
+  call get_time(time, seconds, days, ticks)
+  residual = mod(seconds, time_step)
+  if (residual .ge. time_step / 2) then
+    seconds = seconds + time_step - residual
+    if (seconds .ge. 86400) then
+      seconds = 0
+      days = days + 1
+    endif
+  else
+    seconds = seconds - residual
+  endif
+  normalize_time = set_time(seconds, days, ticks)
+end function normalize_time
 
 subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers, block_, &
                             aerosol_optics_clock, cloud_optics_clock, flux_solver_clock, &
