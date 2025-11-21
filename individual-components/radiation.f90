@@ -27,8 +27,8 @@ use random_number_streams_mod, only: random_number_streams_init, &
 use solar_constant, only: SolarConstant
 use solar_spectrum, only: SolarSpectrum
 use time_interp_external2_mod, only: time_interp_external_init
-use time_manager_mod, only: get_date, julian, print_time, set_calendar_type, time_manager_init, &
-                            time_type, get_time, set_time, operator(+), operator(-), operator(/)
+use time_manager_mod, only: get_date, julian, noleap, print_time, set_calendar_type, time_manager_init, &
+                            time_type, get_time, set_time, operator(+), operator(-), operator(/), set_date
 use tracer_manager_mod, only: get_number_tracers, get_tracer_index, &
                               tracer_manager_end, tracer_manager_init
 use utilities, only: catch_error, integrate
@@ -76,6 +76,7 @@ real :: surface_albedo_weight !Weighting needed to combine "nir" and "vis" albed
 real(kind=wp), dimension(:, :), allocatable :: swabs_integral
 integer :: t
 type(time_type) :: time
+type(time_type) :: forcing_time
 type(time_type) :: time_next
 type(time_type) :: timestep
 real :: top_level_pressure
@@ -100,13 +101,15 @@ real, parameter :: qmin = 1.e-10
 type(block_control_type) :: column_blocking
 
 !Runtime options.
+integer :: forcing_year = -1 !Year of the forcing for solar, ghg, and aerosol
 integer :: near_infrared_cutoff = 14600 !Wavenumber [cm-1] that distinguishes the visible from the near-infrared.
 integer :: nxblocks = 1
 integer :: nyblocks = 1
 logical :: remove_last_timestep = .false.
 character(len=256) :: solar_constant_path = ""
 character(len=256) :: solar_spectrum_path = ""
-namelist /standalone_radiation_nml/ near_infrared_cutoff, &
+namelist /standalone_radiation_nml/ forcing_year, & 
+                                    near_infrared_cutoff, &
                                     nxblocks, &
                                     nyblocks, &
                                     solar_constant_path, &
@@ -143,8 +146,10 @@ call create_atmosphere(atm, column_blocking, nxblocks, nyblocks)
 !Set the model time.
 if (trim(atm(1)%calendar) .eq. "julian") then
   call set_calendar_type(julian)
+elseif (trim(atm(1)%calendar) .eq. "noleap") then
+  call set_calendar_type(noleap)
 else
-  call error_mesg("main", "only julian calendar supported.", fatal)
+  call error_mesg("main", "only julian and noleap calendar supported.", fatal)
 endif
 time = get_cal_time(atm(1)%time(1), atm(1)%time_units, atm(1)%calendar)
 time = normalize_time(time)
@@ -152,6 +157,10 @@ if (atm(1)%num_times .gt. 1) then
   dt = atm(1)%time(2) - atm(1)%time(1)
 else
   dt = 0.
+endif
+
+if (mpp_pe() .eq. mpp_root_pe()) then
+  call print_time(time, "Starting radiation timestep: ")
 endif
 
 !Read in the solar data.
@@ -305,9 +314,16 @@ do t = 1, atm(1)%num_times-invalid_timestep
   !Read in the atmospheric properies.
   call read_time_slice(atm, t, column_blocking)
 
+  if (forcing_year .ge. 0) then
+      call get_date(time, date(1), date(2), date(3), date(4), date(5), date(6))
+      forcing_time = set_date(forcing_year, date(2), date(3), date(4), date(5), date(6))
+  else
+      forcing_time = time
+  endif
+
   !Time interpolation.
-  call solar_flux_constant%update(time)
-  call radiation_context%update(time)
+  call solar_flux_constant%update(forcing_time)
+  call radiation_context%update(forcing_time)
 
 !$omp parallel do private(block_) default(shared)
   do block_ = 1, num_blocks
