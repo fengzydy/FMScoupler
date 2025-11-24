@@ -32,6 +32,7 @@ use time_manager_mod, only: get_date, julian, noleap, print_time, set_calendar_t
 use tracer_manager_mod, only: get_number_tracers, get_tracer_index, &
                               tracer_manager_end, tracer_manager_init
 use utilities, only: catch_error, integrate
+use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
 implicit none
 
 
@@ -81,6 +82,11 @@ type(time_type) :: time_next
 type(time_type) :: timestep
 real :: top_level_pressure
 integer :: invalid_timestep
+integer, allocatable :: block_status(:)
+integer :: retry
+integer :: lookback, orig_t
+logical :: found_good_time
+integer :: max_lookback
 !MPP timers.
 integer :: aerosol_optics_clock
 integer :: cloud_optics_clock
@@ -295,6 +301,9 @@ else
 endif
 deallocate(shortwave_band_limits)
 
+! Allocate block_status once for the run to avoid repeated allocation/race conditions
+allocate(block_status(num_blocks))
+
 !Main loop.
 !The last timestep of offline input files might be invalid
 !Remove the last timestep if needed.
@@ -325,21 +334,61 @@ do t = 1, atm(1)%num_times-invalid_timestep
   call solar_flux_constant%update(forcing_time)
   call radiation_context%update(forcing_time)
 
-!$omp parallel do private(block_) default(shared)
-  do block_ = 1, num_blocks
-    call radiation_scheme(radiation_context, atm(block_), column_blocking, num_layers, block_, &
-                          aerosol_optics_clock, cloud_optics_clock, flux_solver_clock, &
-                          gas_optics_clock, radiation_driver_clock, h2o, o3, last_infrared_band, &
-                          aerosol_species_diags, cloud_diags, flux_diags, time, time_next, solar_flux_constant, &
-                          surface_albedo_weight, all_, clean, clean_clear, clear, &
-                          olr_integral, swabs_integral)
+  ! Try the current timestep and, if it fails, search backwards to
+  ! the most recent earlier timestep that yields a successful radiation run.
+  orig_t = t
+  found_good_time = .false.
+  ! Limit lookback to at most 5 earlier timesteps to avoid excessive searching.
+  max_lookback = min(5, orig_t - 1)
+  do lookback = 0, max_lookback
+    if (lookback == 0) then
+      call read_time_slice(atm, orig_t, column_blocking)
+    else
+      call read_time_slice(atm, orig_t - lookback, column_blocking)
+    endif
+
+    block_status(:) = 0
+    !$omp parallel do private(block_) default(shared)
+    do block_ = 1, num_blocks
+      call radiation_scheme(radiation_context, atm(block_), column_blocking, num_layers, block_, &
+                            aerosol_optics_clock, cloud_optics_clock, flux_solver_clock, &
+                            gas_optics_clock, radiation_driver_clock, h2o, o3, last_infrared_band, &
+                            aerosol_species_diags, cloud_diags, flux_diags, time, time_next, solar_flux_constant, &
+                            surface_albedo_weight, all_, clean, clean_clear, clear, &
+                            olr_integral, swabs_integral, block_status(block_))
+    enddo
+    !$omp end parallel do
+
+    if (.not. any(block_status /= 0)) then
+      if (lookback > 0 .and. mpp_pe() .eq. mpp_root_pe()) then
+        write(logfile_handle, *) 'Warning: radiation failed at t=', orig_t, ' recovered using t=', orig_t - lookback
+      endif
+      found_good_time = .true.
+      exit
+    else
+      if (orig_t - lookback <= 1) then
+        ! No earlier time to try.
+        exit
+      endif
+      ! Otherwise, continue to next earlier timestep and try again.
+    endif
   enddo
+
+  if (.not. found_good_time) then
+    if (mpp_pe() .eq. mpp_root_pe()) then
+      write(logfile_handle, *) 'Error: radiation failed for timestep', orig_t, 'and all earlier times; aborting.'
+    endif
+    call error_mesg('main', 'radiation failed for all earlier timesteps; aborting.', fatal)
+  endif
 
   !Write out diagnostics.
   call diag_manager_set_time_end(time)
   call diag_send_complete(time)
   time = time_next
 enddo
+  if (allocated(block_status)) then
+    deallocate(block_status)
+  endif
 
 !Clean up.
 deallocate(ak, bk)
@@ -390,7 +439,7 @@ subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers,
                             gas_optics_clock, radiation_driver_clock, h2o, o3, last_infrared_band, &
                             aerosol_species_diags, cloud_diags, flux_diags, time, time_next, solar_flux_constant, &
                             surface_albedo_weight, all_, clean, clean_clear, clear, &
-                            olr_integral, swabs_integral)
+                            olr_integral, swabs_integral, status)
 
   type(RadiationContext), intent(inout) :: radiation_context
   type(Atmosphere_t), intent(in), target :: atm
@@ -418,6 +467,7 @@ subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers,
   integer, intent(in) :: clear
   real(kind=wp), dimension(:, :), intent(inout) :: olr_integral
   real(kind=wp), dimension(:, :), intent(inout) :: swabs_integral
+  integer, intent(out) :: status
 
   integer :: band, column, i, n, num_bands, num_columns, num_lat, num_levels, num_lon, s
   real, dimension(:, :, :), allocatable :: aerosol_relative_humidity
@@ -479,6 +529,33 @@ subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers,
   num_columns = num_lon*num_lat
   num_levels = num_layers + 1
 
+  ! Initialize status and perform quick NaN checks on essential fields.
+  status = 0
+  if (any(ieee_is_nan(atm%ppmv))) then
+    status = 1
+    return
+  endif
+  if (any(ieee_is_nan(atm%layer_temperature))) then
+    status = 1
+    return
+  endif
+  if (any(ieee_is_nan(atm%level_temperature))) then
+    status = 1
+    return
+  endif
+  if (any(ieee_is_nan(atm%level_pressure))) then
+    status = 1
+    return
+  endif
+  if (any(ieee_is_nan(atm%layer_pressure))) then
+    status = 1
+    return
+  endif
+  if (any(ieee_is_nan(atm%surface_temperature))) then
+    status = 1
+    return
+  endif
+
   !Get gpoint limits
   call radiation_context%longwave_gas_optics%gpoint_limits(longwave_gpoint_limits)
   call radiation_context%shortwave_gas_optics%gpoint_limits(shortwave_gpoint_limits)
@@ -518,12 +595,18 @@ subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers,
   allocate(surface_emissivity(num_bands, num_columns))
   surface_emissivity(:, :) = 1.
 
-  !Start the radiation timer.
-  call mpp_clock_begin(radiation_driver_clock)
-
   !Update gas concentrations.
   water_vapor(1:num_columns, 1:num_layers) => atm%ppmv(1:num_lon, 1:num_lat, 1:num_layers, h2o)
   ozone(1:num_columns, 1:num_layers) => atm%ppmv(1:num_lon, 1:num_lat, 1:num_layers, o3)
+  ! If ozone VMRs are out of the valid range [0,1], signal failure so
+  ! the driver can retry the timestep using the previous input.
+  if (any(ozone < 0.0_wp .or. ozone > 1.0_wp)) then
+    if (mpp_pe() .eq. mpp_root_pe()) then
+      write(logfile_handle, *) 'Warning: ozone values out of [0,1] found in block', block_, '; requesting retry with previous timestep'
+    endif
+    status = 1
+    return
+  endif
   call radiation_context%update_concentrations(water_vapor, ozone, block_)
 
   !Calculate gas optics.
@@ -533,6 +616,8 @@ subroutine radiation_scheme(radiation_context, atm, column_blocking, num_layers,
   level_temperature(1:num_columns, 1:num_levels) => atm%level_temperature(1:num_lon, 1:num_lat, 1:num_levels)
   surface_temperature(1:num_columns) => atm%surface_temperature(1:num_lon, 1:num_lat)
   zenith(1:num_columns) => atm%solar_zenith_angle(1:num_lon, 1:num_lat)
+  !Start the radiation timer.
+  call mpp_clock_begin(radiation_driver_clock)
   call mpp_clock_begin(gas_optics_clock)
   call radiation_context%calculate_gas_optics(layer_pressure, level_pressure, &
                                               layer_temperature, level_temperature, &
